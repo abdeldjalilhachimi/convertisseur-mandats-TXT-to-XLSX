@@ -1,4 +1,11 @@
 [server]
-address = "0.0.0.0"
-port = 8501
 headless = true
+enableCORS = false
+enableXsrfProtection = false
+address = "0.0.0.0"
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = true
