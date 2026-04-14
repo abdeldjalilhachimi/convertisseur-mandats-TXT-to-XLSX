@@ -74,16 +74,18 @@ def parse_header(line: str) -> dict:
     # ── Format fixe original (62 car.) ───────────────────────────────────────
     if len(line) < LINE_LEN:
         raise ValueError(f"En-tête invalide (trop courte) : {line!r}")
+    montant_raw = int(line[22:35])
     return {
-        "rib_compte":   "",
-        "reference":    line[12:22],
-        "montant_total": int(line[22:35]) / 1000,
-        "nb_lignes":    int(line[35:41]),
-        "periode":      f"{line[41:43]}/{line[43:47]}",
-        "organisme":    line[47:55].strip(),
-        "lot":          line[55:61].strip(),
-        "fin":          line[61:62],
-        "format":       "fixed",
+        "rib_compte":       "",
+        "reference":        line[12:22],
+        "montant_total":    montant_raw / 100,
+        "montant_total_raw": montant_raw,
+        "nb_lignes":        int(line[35:41]),
+        "periode":          f"{line[41:43]}/{line[43:47]}",
+        "organisme":        line[47:55].strip(),
+        "lot":              line[55:61].strip(),
+        "fin":              line[61:62],
+        "format":           "fixed",
     }
 
 
@@ -146,14 +148,26 @@ def parse_detail(line: str, num: int) -> dict:
 
     # ── Format fixe original (62 car.) ───────────────────────────────────────
     s = s.ljust(LINE_LEN)
+    montant_raw = int(s[21:34])
     return {
         "n":            num,
         "prefixe":      s[1:9],
         "rib":          format_rib(s[9:21]),
-        "montant":      int(s[21:34]) / 100,
+        "montant_raw":  montant_raw,
+        "montant":      montant_raw / 100,   # may be corrected by parse_file
         "beneficiaire": s[34:61].rstrip(),
         "type":         s[61:62],
     }
+
+
+def _nearest_divisor(ratio: float) -> int:
+    """Round ratio to the nearest standard divisor in {1, 10, 100, 1000}."""
+    best, best_err = 100, float("inf")
+    for d in (1, 10, 100, 1000):
+        err = abs(ratio - d) / d
+        if err < best_err:
+            best_err, best = err, d
+    return best
 
 
 def parse_file(path: Path) -> tuple[dict, list[dict]]:
@@ -163,6 +177,22 @@ def parse_file(path: Path) -> tuple[dict, list[dict]]:
         raise ValueError(f"Fichier vide : {path}")
     header = parse_header(lines[0])
     details = [parse_detail(l, i) for i, l in enumerate(lines[1:], start=1)]
+
+    # ── Auto-correct divisor for fixed-format files ───────────────────────────
+    # Header montant_raw is always stored as centimes×something; we fix at /100.
+    # Detail montant_raw may use a different scale. Detect it from the ratio
+    # between the header raw value and the sum of detail raw values.
+    if (header.get("format") == "fixed"
+            and header.get("montant_total_raw", 0) > 0):
+        detail_sum_raw = sum(d.get("montant_raw", 0) for d in details)
+        if detail_sum_raw > 0:
+            ratio = header["montant_total_raw"] / detail_sum_raw
+            detail_div = _nearest_divisor(ratio)
+            if detail_div != 100:          # 100 is already the default
+                for d in details:
+                    if "montant_raw" in d:
+                        d["montant"] = d["montant_raw"] / detail_div
+
     return header, details
 
 
