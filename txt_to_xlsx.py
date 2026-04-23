@@ -29,6 +29,32 @@ LINE_LEN = 62
 AMOUNT_ALIGN = Alignment(horizontal="right")
 
 
+# ── Format v2 detection ──────────────────────────────────────────────────────
+# v2: RIP(20) + Montant(13) + Effectif(7) + MOIS(2) + ANNEE(4)
+#       + EMPLOYEUR(6) + NUM_MANT(8) = 60 data chars
+# Lines may have an optional leading '*' (ignored) and optional trailing char.
+# Distinguished from old fixed format by absence of 11 leading zeros after '*'.
+
+def _v2_data(line: str) -> str:
+    """Return the 60-char data portion of a v2 line, stripping leading '*' and trailing char."""
+    s = line[1:] if line.startswith(HEADER_MARKER) else line
+    return s[:60]
+
+
+def _is_v2(line: str) -> bool:
+    """Return True if line matches the new v2 fixed format."""
+    data = _v2_data(line)
+    if len(data) < 60:
+        return False
+    # Old fixed format starts with 11 zeros
+    if data[:11] == "00000000000":
+        return False
+    # Old space format has spaces before position 34
+    if " " in data[:34]:
+        return False
+    return True
+
+
 def format_rib(rib: str) -> str:
     """CCP accounts (12 chars, starts with '000') → 'NNNNNNNNNN/KK'."""
     if len(rib) == 12 and rib[:3] == "000" and "/" not in rib:
@@ -41,13 +67,63 @@ def fmt_amount(value: float) -> str:
     return f"{value:,.2f}".replace(",", " ")
 
 
+def parse_header_v2(line: str) -> dict:
+    """Parse en-tête format v2 (leading '*' ignored) :
+    RIP(0:20) + Montant(20:33) + Effectif(33:40) + MOIS(40:42)
+    + ANNEE(42:46) + EMPLOYEUR(46:52) + NUM_MANT(52:60) [+ trail(60)]
+    """
+    d = _v2_data(line).ljust(60)
+    mois  = d[40:42]
+    annee = d[42:46]
+    eff_s = d[33:40]
+    return {
+        "rip":          d[0:20].strip(),
+        "montant_total": int(d[20:33]) / 100,
+        "effectif":     int(eff_s) if eff_s.strip().isdigit() else 0,
+        "mois":         mois,
+        "annee":        annee,
+        "periode":      f"{mois}/{annee}",
+        "employeur":    d[46:52].strip(),
+        "num_mant":     d[52:60].strip(),
+        # compat fields used by write functions
+        "rib_compte":   d[0:20].strip(),
+        "reference":    d[0:20].strip(),
+        "nb_lignes":    int(eff_s) if eff_s.strip().isdigit() else 0,
+        "organisme":    d[46:52].strip(),
+        "lot":          d[52:60].strip(),
+        "format":       "v2",
+    }
+
+
+def parse_detail_v2(line: str, num: int) -> dict:
+    """Parse ligne détail format v2 (leading '*' ignored) :
+    RIP(0:20) + Montant(20:33) + NOM_ET_PRENOM(33:60) [+ trail(60)]
+    """
+    d = _v2_data(line).ljust(60)
+    return {
+        "n":            num,
+        "rip":          d[0:20].strip(),
+        "montant":      int(d[20:33]) / 100,
+        "nom_prenom":   d[33:60].rstrip(),
+        # compat fields
+        "prefixe":      "",
+        "rib":          d[0:20].strip(),
+        "beneficiaire": d[33:60].rstrip(),
+        "type":         "",
+    }
+
+
 def parse_header(line: str) -> dict:
-    """Parse la ligne d'en-tête — deux formats supportés :
-    • Fixe (62 car.) : format original
-    • Espaces        : *RIB F1 TOTAL NB_LIGNES MMYYYY ORGANISME F6 LOT FIN
+    """Parse la ligne d'en-tête — trois formats supportés :
+    • v2     (62 car.) : *+RIP(20)+Montant(13)+Effectif(7)+MOIS(2)+ANNEE(4)+EMPLOYEUR(6)+NUM_MANT(8)
+    • Fixe   (62 car.) : format original (11 zéros après *)
+    • Espaces          : *RIB F1 TOTAL NB_LIGNES MMYYYY ORGANISME F6 LOT FIN
     """
     if not line.startswith(HEADER_MARKER):
         raise ValueError(f"En-tête invalide : {line!r}")
+
+    if _is_v2(line):
+        return parse_header_v2(line)
 
     # ── Format espace-séparé (ligne > 62 car.) ───────────────────────────────
     # Layout fixe (9 tokens séparés par espaces) :
@@ -162,7 +238,10 @@ def parse_file(path: Path) -> tuple[dict, list[dict]]:
     if not lines:
         raise ValueError(f"Fichier vide : {path}")
     header = parse_header(lines[0])
-    details = [parse_detail(l, i) for i, l in enumerate(lines[1:], start=1)]
+    if header["format"] == "v2":
+        details = [parse_detail_v2(l, i) for i, l in enumerate(lines[1:], start=1)]
+    else:
+        details = [parse_detail(l, i) for i, l in enumerate(lines[1:], start=1)]
     return header, details
 
 
@@ -175,12 +254,20 @@ def add_details_sheet(wb, files_data: list) -> None:
     COL_FILL   = PatternFill("solid", fgColor="BDD7EE")
     COL_FONT   = Font(bold=True)
     META_LABEL = Font(bold=True, color="305496")
-    COL_HEADERS = ["N°", "Préfixe", "RIB / CCP", "Montant (DZD)", "Bénéficiaire", "Type"]
-    N_COLS = len(COL_HEADERS)
+
+    COL_HEADERS_V1 = ["N°", "Préfixe", "RIB / CCP", "Montant (DZD)", "Bénéficiaire", "Type"]
+    COL_HEADERS_V2 = ["N°", "RIP", "Montant (DZD)", "NOM ET PRENOM"]
+
+    # Use max column count for merges
+    N_COLS = max(len(COL_HEADERS_V1), len(COL_HEADERS_V2))
 
     current_row = 1
 
     for header, details, src in files_data:
+        is_v2 = header["format"] == "v2"
+        col_headers = COL_HEADERS_V2 if is_v2 else COL_HEADERS_V1
+        amt_col = 3 if is_v2 else 4
+
         # ── File title bar ──────────────────────────────────────────────────
         ws.merge_cells(start_row=current_row, start_column=1,
                        end_row=current_row, end_column=N_COLS)
@@ -193,20 +280,32 @@ def add_details_sheet(wb, files_data: list) -> None:
         current_row += 1
 
         # ── Metadata key-value pairs ─────────────────────────────────────────
-        meta = []
-        if header.get("rib_compte"):
-            meta.append(("RIB / CCP organisme", header["rib_compte"]))
+        if is_v2:
+            meta = [
+                ("RIP compte",          header["rip"]),
+                ("Période (MM/AAAA)",   header["periode"]),
+                ("Employeur",           header["employeur"]),
+                ("N° Mandat",           header["num_mant"]),
+                ("Effectif déclaré",    header["effectif"]),
+                ("Lignes lues",         len(details)),
+                ("Montant déclaré (DZD)", fmt_amount(header["montant_total"])),
+                ("Montant calculé (DZD)", fmt_amount(sum(d["montant"] for d in details))),
+            ]
         else:
-            meta.append(("Référence", header["reference"]))
-        meta += [
-            ("Période (MM/AAAA)",      header["periode"]),
-            ("Code organisme",         header["organisme"]),
-            ("N° lot",                 header["lot"]),
-            ("Lignes déclarées",       header["nb_lignes"]),
-            ("Lignes lues",            len(details)),
-            ("Montant déclaré (DZD)",  fmt_amount(header["montant_total"])),
-            ("Montant calculé (DZD)",  fmt_amount(sum(d["montant"] for d in details))),
-        ]
+            meta = []
+            if header.get("rib_compte"):
+                meta.append(("RIB / CCP organisme", header["rib_compte"]))
+            else:
+                meta.append(("Référence", header["reference"]))
+            meta += [
+                ("Période (MM/AAAA)",      header["periode"]),
+                ("Code organisme",         header["organisme"]),
+                ("N° lot",                 header["lot"]),
+                ("Lignes déclarées",       header["nb_lignes"]),
+                ("Lignes lues",            len(details)),
+                ("Montant déclaré (DZD)",  fmt_amount(header["montant_total"])),
+                ("Montant calculé (DZD)",  fmt_amount(sum(d["montant"] for d in details))),
+            ]
         for label, value in meta:
             lbl = ws.cell(row=current_row, column=1, value=label)
             lbl.font = META_LABEL
@@ -218,7 +317,7 @@ def add_details_sheet(wb, files_data: list) -> None:
         current_row += 1  # blank separator before table
 
         # ── Table header ─────────────────────────────────────────────────────
-        for col, h in enumerate(COL_HEADERS, start=1):
+        for col, h in enumerate(col_headers, start=1):
             cell = ws.cell(row=current_row, column=col, value=h)
             cell.font = COL_FONT
             cell.fill = COL_FILL
@@ -228,25 +327,32 @@ def add_details_sheet(wb, files_data: list) -> None:
         # ── Mandate rows ──────────────────────────────────────────────────────
         for d in details:
             ws.cell(row=current_row, column=1, value=d["n"])
-            ws.cell(row=current_row, column=2, value=d["prefixe"])
-            rib = ws.cell(row=current_row, column=3, value=d["rib"])
-            rib.number_format = "@"
-            amt = ws.cell(row=current_row, column=4, value=fmt_amount(d["montant"]))
-            amt.alignment = AMOUNT_ALIGN
-            ws.cell(row=current_row, column=5, value=d["beneficiaire"])
-            ws.cell(row=current_row, column=6, value=d["type"])
+            if is_v2:
+                rip = ws.cell(row=current_row, column=2, value=d["rip"])
+                rip.number_format = "@"
+                amt = ws.cell(row=current_row, column=3, value=fmt_amount(d["montant"]))
+                amt.alignment = AMOUNT_ALIGN
+                ws.cell(row=current_row, column=4, value=d["nom_prenom"])
+            else:
+                ws.cell(row=current_row, column=2, value=d["prefixe"])
+                rib = ws.cell(row=current_row, column=3, value=d["rib"])
+                rib.number_format = "@"
+                amt = ws.cell(row=current_row, column=4, value=fmt_amount(d["montant"]))
+                amt.alignment = AMOUNT_ALIGN
+                ws.cell(row=current_row, column=5, value=d["beneficiaire"])
+                ws.cell(row=current_row, column=6, value=d["type"])
             current_row += 1
 
         # ── Subtotal ──────────────────────────────────────────────────────────
         ws.cell(row=current_row, column=1, value="TOTAL").font = Font(bold=True)
-        sub = ws.cell(row=current_row, column=4,
+        sub = ws.cell(row=current_row, column=amt_col,
                       value=fmt_amount(sum(d["montant"] for d in details)))
         sub.font = Font(bold=True)
         sub.alignment = AMOUNT_ALIGN
         current_row += 2  # blank row between file sections
 
     # ── Column widths ─────────────────────────────────────────────────────────
-    col_widths = [28, 24, 16, 15, 32, 6]
+    col_widths = [6, 24, 17, 35, 32, 6]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -263,19 +369,31 @@ def write_xlsx(header: dict, details: list[dict], src: Path, out: Path) -> None:
         ws_h[c].font = Font(bold=True, color="FFFFFF")
         ws_h[c].fill = PatternFill("solid", fgColor="305496")
     rows_h = [("Fichier source", src.name)]
-    if header.get("rib_compte"):
-        rows_h.append(("RIB / CCP organisme", header["rib_compte"]))
+    if header["format"] == "v2":
+        rows_h += [
+            ("RIP compte",          header["rip"]),
+            ("Période (MM/AAAA)",   header["periode"]),
+            ("Employeur",           header["employeur"]),
+            ("N° Mandat",           header["num_mant"]),
+            ("Effectif déclaré",    header["effectif"]),
+            ("Lignes lues",         len(details)),
+            ("Montant déclaré (DZD)", fmt_amount(header["montant_total"])),
+            ("Montant calculé (DZD)", fmt_amount(sum(d["montant"] for d in details))),
+        ]
     else:
-        rows_h.append(("Référence", header["reference"]))
-    rows_h += [
-        ("Période (MM/AAAA)", header["periode"]),
-        ("Code organisme",    header["organisme"]),
-        ("N° lot",            header["lot"]),
-        ("Lignes déclarées",  header["nb_lignes"]),
-        ("Lignes lues",       len(details)),
-        ("Montant total (DZD) déclaré", fmt_amount(header["montant_total"])),
-        ("Montant total (DZD) calculé", fmt_amount(sum(d["montant"] for d in details))),
-    ]
+        if header.get("rib_compte"):
+            rows_h.append(("RIB / CCP organisme", header["rib_compte"]))
+        else:
+            rows_h.append(("Référence", header["reference"]))
+        rows_h += [
+            ("Période (MM/AAAA)", header["periode"]),
+            ("Code organisme",    header["organisme"]),
+            ("N° lot",            header["lot"]),
+            ("Lignes déclarées",  header["nb_lignes"]),
+            ("Lignes lues",       len(details)),
+            ("Montant total (DZD) déclaré", fmt_amount(header["montant_total"])),
+            ("Montant total (DZD) calculé", fmt_amount(sum(d["montant"] for d in details))),
+        ]
     for i, (k, v) in enumerate(rows_h, start=2):
         ws_h.cell(row=i, column=1, value=k)
         ws_h.cell(row=i, column=2, value=v)
@@ -288,9 +406,15 @@ def write_xlsx(header: dict, details: list[dict], src: Path, out: Path) -> None:
 
     # --- Feuille Mandats ---
     ws = wb.create_sheet("Mandats")
-    headers = ["N°", "Préfixe", "RIB / CCP", "Montant (DZD)", "Bénéficiaire", "Type"]
-    ws.append(headers)
-    for col in range(1, len(headers) + 1):
+    is_v2 = header["format"] == "v2"
+    if is_v2:
+        col_headers = ["N°", "RIP", "Montant (DZD)", "NOM ET PRENOM"]
+        widths = [6, 22, 17, 35]
+    else:
+        col_headers = ["N°", "Préfixe", "RIB / CCP", "Montant (DZD)", "Bénéficiaire", "Type"]
+        widths = [6, 10, 16, 15, 32, 6]
+    ws.append(col_headers)
+    for col in range(1, len(col_headers) + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="305496")
@@ -298,29 +422,36 @@ def write_xlsx(header: dict, details: list[dict], src: Path, out: Path) -> None:
 
     for r, d in enumerate(details, start=2):
         ws.cell(row=r, column=1, value=d["n"])
-        ws.cell(row=r, column=2, value=d["prefixe"])
-        rib_cell = ws.cell(row=r, column=3, value=d["rib"])
-        rib_cell.number_format = "@"
-        amt_cell = ws.cell(row=r, column=4, value=fmt_amount(d["montant"]))
-        amt_cell.alignment = AMOUNT_ALIGN
-        ws.cell(row=r, column=5, value=d["beneficiaire"])
-        ws.cell(row=r, column=6, value=d["type"])
+        if is_v2:
+            rip_cell = ws.cell(row=r, column=2, value=d["rip"])
+            rip_cell.number_format = "@"
+            amt_cell = ws.cell(row=r, column=3, value=fmt_amount(d["montant"]))
+            amt_cell.alignment = AMOUNT_ALIGN
+            ws.cell(row=r, column=4, value=d["nom_prenom"])
+        else:
+            ws.cell(row=r, column=2, value=d["prefixe"])
+            rib_cell = ws.cell(row=r, column=3, value=d["rib"])
+            rib_cell.number_format = "@"
+            amt_cell = ws.cell(row=r, column=4, value=fmt_amount(d["montant"]))
+            amt_cell.alignment = AMOUNT_ALIGN
+            ws.cell(row=r, column=5, value=d["beneficiaire"])
+            ws.cell(row=r, column=6, value=d["type"])
 
     # total
     total_row = len(details) + 2
     ws.cell(row=total_row, column=1, value="TOTAL").font = Font(bold=True)
-    total_cell = ws.cell(row=total_row, column=4,
+    amt_col = 3 if is_v2 else 4
+    total_cell = ws.cell(row=total_row, column=amt_col,
                          value=fmt_amount(sum(d["montant"] for d in details)))
     total_cell.font = Font(bold=True)
     total_cell.alignment = AMOUNT_ALIGN
 
     # largeurs
-    widths = [6, 10, 16, 15, 32, 6]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{total_row - 1}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(col_headers))}{total_row - 1}"
 
     # --- Feuille Détails ---
     add_details_sheet(wb, [(header, details, src)])
